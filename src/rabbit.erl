@@ -280,6 +280,7 @@
 
 start() ->
     %% We want to throw an error.
+    rabbit_log:info("RabbitMQ is asked to start...", []),
     case application:ensure_all_started(rabbitmq_prelaunch) of
         {ok, _} ->
             case application:ensure_all_started(rabbit) of
@@ -295,6 +296,7 @@ start() ->
 boot() ->
     %% We want the node to exit: because applications are started with
     %% `transient`, any error during their startup will abort the node.
+    rabbit_log:info("RabbitMQ is asked to boot...", []),
     {ok, _} = application:ensure_all_started(rabbitmq_prelaunch, transient),
     {ok, _} = application:ensure_all_started(rabbit, transient),
     ok.
@@ -317,52 +319,60 @@ run_prelaunch_second_phase() ->
     %% RabbitMQ core. That's why we need to run it now, from the
     %% `rabbit` application start function.
 
-    %% We assert Mnesia is stopped before we run the second prelaunch
-    %% phase.
-    RunningApps = application:which_applications(),
-    false = lists:keymember(mnesia, 1, RunningApps),
+    %% We assert Mnesia is stopped before we run the prelaunch
+    %% phases. See `rabbit_prelaunch` for an explanation.
+    %%
+    %% This is the second assertion, just in case Mnesia is started
+    %% between the two prelaunch phases.
+    rabbit_prelaunch:assert_mnesia_is_stopped(),
 
     %% Get the context created by `rabbitmq_prelaunch` then proceed
     %% with all steps in this phase.
-    Context0 = rabbit_prelaunch:get_context(),
-    IsInitialRun =
-    application:get_env(rabbit, prelaunch_initial_run) =/= {ok, done},
-    Context = Context0#{initial_pass => IsInitialRun},
+    #{initial_pass := IsInitialPass} =
+    Context = rabbit_prelaunch:get_context(),
 
-    %% 1. Feature flags registry
+    case IsInitialPass of
+        true ->
+            rabbit_log_prelaunch:debug(""),
+            rabbit_log_prelaunch:debug(
+              "== Prelaunch phase [2/2] (initial pass) ==");
+        false ->
+            rabbit_log_prelaunch:debug(""),
+            rabbit_log_prelaunch:debug("== Prelaunch phase [2/2] =="),
+            ok
+    end,
+
+    %% 1. Feature flags registry.
     ok = rabbit_prelaunch_feature_flags:setup(Context),
 
-    %% 2. Configuration check + loading
+    %% 2. Configuration check + loading.
     ok = rabbit_prelaunch_conf:setup(Context),
 
-    %% 3. Logging
+    %% 3. Logging.
     ok = rabbit_prelaunch_logging:setup(Context),
 
-    case IsInitialRun of
+    case IsInitialPass of
         true ->
-            %% 4. HiPE compilation
-            ok = rabbit_prelaunch_hipe:setup(Context),
-
-            ok = application:set_env(
-                   rabbit, prelaunch_initial_run, done,
-                   [{persistent, true}]);
+            %% 4. HiPE compilation.
+            ok = rabbit_prelaunch_hipe:setup(Context);
         false ->
             ok
     end,
 
-    %% 5. Clustering
+    %% 5. Clustering.
     ok = rabbit_prelaunch_cluster:setup(Context),
+
+    %% Start Mnesia now that everything is ready.
+    rabbit_log_prelaunch:debug("Starting Mnesia"),
+    ok = mnesia:start(),
 
     rabbit_log_prelaunch:debug(""),
     rabbit_log_prelaunch:debug("== Prelaunch DONE =="),
 
-    %% Mnesia was stopped in rabbit_prelaunch:do_run() before we
-    %% could setup distribution and clustering. Now that it's done,
-    %% we can start it again.
-    rabbit_log_prelaunch:debug(
-      "Starting Mnesia again (now that Erlang distribution is enabled"),
-    ok = mnesia:start(),
-
+    case IsInitialPass of
+        true  -> rabbit_prelaunch:initial_pass_finished();
+        false -> ok
+    end,
     ok.
 
 %% Try to send systemd ready notification if it makes sense in the
@@ -488,10 +498,13 @@ stop() ->
             ok = wait_for_boot_to_finish(node())
     end,
     rabbit_log:info("RabbitMQ is asked to stop...~n", []),
-    Apps = ?APPS ++ rabbit_plugins:active(),
+    Apps0 = ?APPS ++ rabbit_plugins:active(),
+    %% We ensure that Mnesia is stopped last (or more exactly, after rabbit).
+    Apps1 = app_utils:app_dependency_order(Apps0, true) -- [mnesia],
+    Apps = [mnesia | Apps1],
     %% this will also perform unregistration with the peer discovery backend
     %% as needed
-    stop_apps(app_utils:app_dependency_order(Apps, true)),
+    stop_apps(Apps),
     rabbit_log:info("Successfully stopped RabbitMQ and its dependencies~n", []).
 
 -spec stop_and_halt() -> no_return().
@@ -848,6 +861,41 @@ start(normal, []) ->
         {ok, SupPid}
     catch
         throw:{error, _} = Error ->
+            mnesia:stop(),
+            rabbit_prelaunch_errors:log_error(Error),
+            Error;
+        Class:Exception:Stacktrace ->
+            mnesia:stop(),
+            rabbit_prelaunch_errors:log_exception(
+              Class, Exception, Stacktrace),
+            {error, Exception}
+    end.
+
+run_postlaunch_phase() ->
+    spawn(fun do_run_postlaunch_phase/0).
+
+do_run_postlaunch_phase() ->
+    %% Once RabbitMQ itself is started, we need to run a few more steps,
+    %% in particular start plugins.
+    rabbit_log_prelaunch:debug(""),
+    rabbit_log_prelaunch:debug("== Postlaunch phase =="),
+
+    try
+        rabbit_log_prelaunch:debug(""),
+        rabbit_log_prelaunch:debug("== Plugins =="),
+
+        rabbit_log_prelaunch:debug("Setting plugins up"),
+        Plugins = rabbit_plugins:setup(),
+        rabbit_log_prelaunch:debug(
+          "Starting the following plugins: ~p", [Plugins]),
+        start_apps(Plugins),
+
+        maybe_sd_notify(),
+        ok = rabbit_lager:broker_is_started(),
+        ok = log_broker_started(
+               rabbit_plugins:strictly_plugins(rabbit_plugins:active()))
+    catch
+        throw:{error, _} = Error ->
             rabbit_prelaunch_errors:log_error(Error),
             Error;
         Class:Exception:Stacktrace ->
@@ -855,21 +903,6 @@ start(normal, []) ->
               Class, Exception, Stacktrace),
             {error, Exception}
     end.
-
-run_postlaunch_phase() ->
-    % FIXME: Synchronization + error handling?
-    spawn(fun do_run_postlaunch_phase/0).
-
-do_run_postlaunch_phase() ->
-    timer:sleep(1000),
-
-    Plugins = rabbit_plugins:setup(),
-    start_apps(Plugins),
-
-    maybe_sd_notify(),
-    ok = rabbit_lager:broker_is_started(),
-    ok = log_broker_started(
-           rabbit_plugins:strictly_plugins(rabbit_plugins:active())).
 
 prep_stop(State) ->
   rabbit_peer_discovery:maybe_unregister(),

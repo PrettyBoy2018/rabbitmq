@@ -3,10 +3,14 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -export([run_prelaunch_first_phase/0,
+         assert_mnesia_is_stopped/0,
          get_context/0,
+         is_initial_pass/0,
+         initial_pass_finished/0,
          shutdown_func/1]).
 
 -define(PT_KEY_CONTEXT,       {?MODULE, context}).
+-define(PT_KEY_INITIAL_PASS,   {?MODULE, initial_pass_finished}).
 -define(PT_KEY_SHUTDOWN_FUNC, {?MODULE, chained_shutdown_func}).
 
 run_prelaunch_first_phase() ->
@@ -26,12 +30,36 @@ do_run() ->
     %% Configure dbg if requested.
     rabbit_prelaunch_early_logging:enable_quick_dbg(rabbit_env:dbg_config()),
 
+    %% We assert Mnesia is stopped before we run the prelaunch
+    %% phases.
+    %%
+    %% We need this because our cluster consistency check (in the second
+    %% phase) depends on Mnesia not being started before it has a chance
+    %% to run.
+    %%
+    %% Also, in the initial pass, we don't want Mnesia to run before
+    %% Erlang distribution is configured.
+    assert_mnesia_is_stopped(),
+
     %% Get informations to setup logging.
     Context0 = rabbit_env:get_context_before_logging_init(),
     ?assertMatch(#{}, Context0),
 
     %% Setup logging for the prelaunch phase.
     ok = rabbit_prelaunch_early_logging:setup_early_logging(Context0, true),
+
+    IsInitialPass = is_initial_pass(),
+    case IsInitialPass of
+        true ->
+            rabbit_log_prelaunch:debug(""),
+            rabbit_log_prelaunch:debug(
+              "== Prelaunch phase [1/2] (initial pass) =="),
+            rabbit_log_prelaunch:debug("");
+        false ->
+            rabbit_log_prelaunch:debug(""),
+            rabbit_log_prelaunch:debug("== Prelaunch phase [1/2] =="),
+            rabbit_log_prelaunch:debug("")
+    end,
     rabbit_env:log_process_env(),
 
     %% Load rabbitmq-env.conf, redo logging setup and continue.
@@ -41,42 +69,44 @@ do_run() ->
     rabbit_env:log_process_env(),
 
     %% Complete context now that we have the final environment loaded.
-    Context = rabbit_env:get_context_after_reloading_env(Context1),
-    ?assertMatch(#{}, Context),
-    store_context(Context),
-    rabbit_env:log_context(Context),
+    Context2 = rabbit_env:get_context_after_reloading_env(Context1),
+    ?assertMatch(#{}, Context2),
+    store_context(Context2),
+    rabbit_env:log_context(Context2),
     ok = setup_shutdown_func(),
+
+    Context = Context2#{initial_pass => IsInitialPass},
 
     rabbit_env:context_to_code_path(Context),
     rabbit_env:context_to_app_env_vars(Context),
 
-    %% Stop Mnesia now. It is started because `rabbit` depends on
-    %% it. But because distribution is not configured yet at the
-    %% time it is started, it is non-functionnal. Having Mnesia
-    %% started also messes with cluster consistency checks.
-    %%
-    %% We can stop it now and start it again at the end of
-    %% rabbit:run_prelaunch_second_phase().
-    rabbit_log_prelaunch:debug(
-      "Ensuring Mnesia is stopped (to permit Erlang distribution setup "
-      "& cluster checks"),
-    stopped = mnesia:stop(),
-
     %% 1. Erlang/OTP compatibility check.
     ok = rabbit_prelaunch_erlang_compat:check(Context),
 
-    %% 2. Erlang distribution check + start
+    %% 2. Erlang distribution check + start.
     ok = rabbit_prelaunch_dist:setup(Context),
 
     %% 3. Write PID file.
     _ = write_pid_file(Context),
     ignore.
 
+assert_mnesia_is_stopped() ->
+    ?assertNot(lists:keymember(mnesia, 1, application:which_applications())).
+
 store_context(Context) when is_map(Context) ->
     persistent_term:put(?PT_KEY_CONTEXT, Context).
 
 get_context() ->
-    persistent_term:get(?PT_KEY_CONTEXT, undefined).
+    case persistent_term:get(?PT_KEY_CONTEXT, undefined) of
+        undefined -> undefined;
+        Context   -> Context#{initial_pass => is_initial_pass()}
+    end.
+
+is_initial_pass() ->
+    not persistent_term:get(?PT_KEY_INITIAL_PASS, false).
+
+initial_pass_finished() ->
+    persistent_term:put(?PT_KEY_INITIAL_PASS, true).
 
 setup_shutdown_func() ->
     ThisMod = ?MODULE,
