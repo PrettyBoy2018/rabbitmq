@@ -856,7 +856,7 @@ start(normal, []) ->
         log_banner(),
         warn_if_kernel_config_dubious(),
         warn_if_disc_io_options_dubious(),
-        rabbit_boot_steps:run_boot_steps(),
+        rabbit_boot_steps:run_boot_steps([rabbit]),
         run_postlaunch_phase(),
         {ok, SupPid}
     catch
@@ -888,7 +888,13 @@ do_run_postlaunch_phase() ->
         Plugins = rabbit_plugins:setup(),
         rabbit_log_prelaunch:debug(
           "Starting the following plugins: ~p", [Plugins]),
-        start_apps(Plugins),
+        lists:foreach(
+          fun(Plugin) ->
+              case application:ensure_all_started(Plugin) of
+                  {ok, _} -> rabbit_boot_steps:run_boot_steps([Plugin]);
+                  Error   -> throw(Error)
+              end
+          end, Plugins),
 
         maybe_sd_notify(),
         ok = rabbit_lager:broker_is_started(),
