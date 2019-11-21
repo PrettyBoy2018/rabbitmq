@@ -101,10 +101,10 @@ start_rabbitmq_server() {
         ${RABBITMQ_START_RABBIT} \
         -boot "${SASL_BOOT_FILE}" \
         +W w \
+        +K true \
         +A ${RABBITMQ_IO_THREAD_POOL_SIZE} \
         ${RABBITMQ_DEFAULT_ALLOC_ARGS} \
         ${RABBITMQ_SERVER_ERL_ARGS} \
-        +K true \
         ${RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS} \
         ${RABBITMQ_SERVER_START_ARGS} \
         -lager crash_log false \

@@ -81,10 +81,9 @@ if "!RABBITMQ_ALLOW_INPUT!"=="" (
 !RABBITMQ_DEFAULT_ALLOC_ARGS! ^
 !RABBITMQ_SERVER_ERL_ARGS! ^
 !RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS! ^
--os_mon start_cpu_sup false ^
--os_mon start_disksup false ^
--os_mon start_memsup false ^
 !RABBITMQ_SERVER_START_ARGS! ^
+-lager crash_log false ^
+-lager handlers "[]" ^
 !STAR!
 
 if ERRORLEVEL 1 (
