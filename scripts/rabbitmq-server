@@ -80,6 +80,7 @@ start_rabbitmq_server() {
             "$SCRIPTS_DIR/rabbitmq-rel" gen-boot
             SASL_BOOT_FILE=rabbit
             test -f "$SASL_BOOT_FILE.boot"
+            RABBITMQ_START_RABBIT="$RABBITMQ_START_RABBIT -init_debug"
         else
             RABBITMQ_START_RABBIT="$RABBITMQ_START_RABBIT -s $RABBITMQ_BOOT_MODULE boot"
         fi
@@ -105,9 +106,6 @@ start_rabbitmq_server() {
         ${RABBITMQ_SERVER_ERL_ARGS} \
         +K true \
         ${RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS} \
-        -os_mon start_cpu_sup false \
-        -os_mon start_disksup false \
-        -os_mon start_memsup false \
         ${RABBITMQ_SERVER_START_ARGS} \
         -lager crash_log false \
         -lager handlers '[]' \
